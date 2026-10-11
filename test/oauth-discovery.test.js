@@ -1,20 +1,26 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, it } from 'node:test';
 
-// STATE_PATH is derived from homedir() at module evaluation, so point HOME at a
-// scratch directory *before* the dynamic import below. Never touch a real ~/.dsh.
+// STATE_PATH is derived from homedir() at module evaluation: HOME on POSIX,
+// USERPROFILE on Windows. Pin both before importing; DSH_HOME alone is not enough.
 const scratchHome = mkdtempSync(join(tmpdir(), 'dsh-mm-oauth-'));
 process.env.HOME = scratchHome;
+process.env.USERPROFILE = scratchHome;
 process.env.DSH_HOME = join(scratchHome, '.dsh');
+after(() => rmSync(scratchHome, { recursive: true, force: true }));
+
+// Fail before loading the plugin if isolation regresses (issue #16). Check the
+// Windows variable even on POSIX so every platform catches a missing assignment.
+assert.equal(process.env.USERPROFILE, scratchHome, 'USERPROFILE must use the scratch home');
+assert.equal(homedir(), scratchHome, 'homedir() must resolve to the scratch home');
 mkdirSync(join(scratchHome, '.dsh'), { recursive: true });
 const statePath = join(scratchHome, '.dsh', 'mcp-manager.json');
 
 const { apply } = await import('../lib/index.js');
-after(() => rmSync(scratchHome, { recursive: true, force: true }));
 
 /** Minimal ctx: enough for apply() to mount its route without a real harness. */
 function makeCtx() {
