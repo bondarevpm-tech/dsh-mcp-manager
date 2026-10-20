@@ -28,7 +28,7 @@ const fixture = fileURLToPath(new URL('../test-fixtures/restart-connect.mjs', im
 
 const { apply } = await import('../lib/index.js');
 
-function makeCtx() {
+function makeCtx(config) {
   const routes = [];
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
@@ -48,7 +48,7 @@ function makeCtx() {
     },
     effect: (fn) => { const dispose = fn(); return () => { if (typeof dispose === 'function') dispose(); }; },
   };
-  apply(ctx);
+  apply(ctx, config);
   return { routes, handler: routes[0]?.handler };
 }
 
@@ -195,8 +195,9 @@ async function complete(handler, id, authorizeUrl) {
   return callback;
 }
 
-it('sends the RFC 8707 resource from the protected-resource document at every step', async () => {
+it('sends the RFC 8707 resource from the protected-resource document at every step', async (t) => {
   const stub = await startStub();
+  t.after(() => stub.close());
   const { handler } = makeCtx();
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', {
     name: 'kontrcheck', type: 'http', url: stub.mcpUrl, authMode: 'oauth', scope: 'kontrcheck.read offline_access',
@@ -224,8 +225,9 @@ it('sends the RFC 8707 resource from the protected-resource document at every st
   await stub.close();
 });
 
-it('refreshes with the resource, rotates the refresh token, and reuses the rotated one', async () => {
+it('refreshes with the resource, rotates the refresh token, and reuses the rotated one', async (t) => {
   const stub = await startStub();
+  t.after(() => stub.close());
   const { handler } = makeCtx();
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'kc2', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
   const id = created.json.server.id;
@@ -261,8 +263,9 @@ it('refreshes with the resource, rotates the refresh token, and reuses the rotat
   await stub.close();
 });
 
-it('restores a connection in a fresh process without re-registering or losing the resource', async () => {
+it('restores a connection in a fresh process without re-registering or losing the resource', async (t) => {
   const stub = await startStub();
+  t.after(() => stub.close());
   const { handler } = makeCtx();
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'kc3', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
   const id = created.json.server.id;
@@ -307,7 +310,7 @@ it('restores a connection in a fresh process without re-registering or losing th
   await stub.close();
 });
 
-it('leaves the flow unchanged when the resource document publishes none', async () => {
+it('leaves the flow unchanged when the resource document publishes none', async (t) => {
   const stub = await startStub({ publishResource: false });
   const { handler } = makeCtx();
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'nores', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
@@ -318,9 +321,10 @@ it('leaves the flow unchanged when the resource document publishes none', async 
   await stub.close();
 });
 
-it('uses the reverse proxy scheme for the callback and rejects a malformed forwarded host', async () => {
+it('honours a forwarded origin only when it is explicitly allowed', async (t) => {
   const stub = await startStub();
-  const { handler } = makeCtx();
+  t.after(() => stub.close());
+  const { handler } = makeCtx({ publicOrigins: ['https://harness.example.com'] });
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'proxy', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
   const id = created.json.server.id;
 
@@ -331,17 +335,54 @@ it('uses the reverse proxy scheme for the callback and rejects a malformed forwa
   assert.equal(auth.code, 200, auth.text);
   assert.equal(new URL(auth.json.authorizeUrl).searchParams.get('redirect_uri'), `https://harness.example.com/mcp-manager/callback/${id}`);
 
-  const spoofed = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+  const malformed = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
     'x-forwarded-proto': 'https',
     'x-forwarded-host': 'evil.example.com/path',
   });
-  assert.equal(spoofed.code, 400, spoofed.text);
-  assert.match(spoofed.json.error, /invalid request host/);
+  assert.equal(malformed.code, 400, malformed.text);
+  assert.match(malformed.json.error, /invalid request host/);
+
+  // A well-formed but unlisted host is a redirect attempt, not a proxy hop.
+  const unlisted = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+    'x-forwarded-proto': 'https',
+    'x-forwarded-host': 'evil.example.com',
+  });
+  assert.equal(unlisted.code, 200, unlisted.text);
+  assert.equal(new URL(unlisted.json.authorizeUrl).searchParams.get('redirect_uri'),
+    `http://127.0.0.1:3080/mcp-manager/callback/${id}`,
+    'an unlisted forwarded host is ignored, never adopted');
+
+  // A host header alone never becomes the public origin.
+  const bareHost = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+    host: 'evil.example.com',
+  });
+  assert.equal(bareHost.code, 200, bareHost.text);
+  assert.equal(new URL(bareHost.json.authorizeUrl).searchParams.get('redirect_uri'), `http://evil.example.com/mcp-manager/callback/${id}`,
+    'a plain Host header still names the origin the browser used');
   await stub.close();
 });
 
-it('escapes server-supplied text on the callback page', async () => {
+it('ignores forwarded headers entirely when no public origin is configured', async (t) => {
   const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'noproxy', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+
+  const auth = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+    'x-forwarded-proto': 'https',
+    'x-forwarded-host': 'harness.roadstash.com',
+  });
+  assert.equal(auth.code, 200, auth.text);
+  assert.equal(new URL(auth.json.authorizeUrl).searchParams.get('redirect_uri'),
+    `http://127.0.0.1:3080/mcp-manager/callback/${id}`,
+    'without an explicit allowlist the forwarded pair must not be trusted');
+  await stub.close();
+});
+
+it('escapes server-supplied text on the callback page', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
   const { handler } = makeCtx();
   const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'xss', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
   const id = created.json.server.id;

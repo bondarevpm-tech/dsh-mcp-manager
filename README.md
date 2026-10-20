@@ -8,8 +8,10 @@ The built-in `@deepseek-ai/dsh-mcp-client` only accepts a static `headers` confi
 
 - **OAuth (authorization code + PKCE)** with spec-compliant discovery, RFC 7591 dynamic client registration, `refresh_token` rotation, and auto-reconnect across restarts — one browser login, then it keeps working.
   - **Callback origin** honours a reverse proxy's `X-Forwarded-Proto`/`X-Forwarded-Host` pair
-    (both must be present and the host must look like `host[:port]`), so an HTTPS deployment
-    registers `https://…/mcp-manager/callback/<id>` instead of silently using plain http.
+    only for an origin listed in `publicOrigins` (e.g. `['https://harness.example.com']`): both
+    headers must be present, the host must look like `host[:port]`, and the result must match an
+    entry exactly. Anything else is ignored and the origin falls back to the request's `Host`
+    header, so a spoofed pair can only degrade the callback to loopback — never move it.
   - **Discovery** follows RFC 9728 → RFC 8414: the MCP endpoint's 401 `WWW-Authenticate` header names its protected-resource metadata, that document names the authorization server, and the authorization server's metadata is read from the RFC 8414 path-inserted URL (e.g. `https://github.com/.well-known/oauth-authorization-server/login/oauth`). Only when nothing is discoverable does it fall back to guessing `${origin}/oauth/*`, and the attempt log says so.
   - **RFC 8707 `resource`** taken from the protected-resource document and sent on authorize, token
     exchange and refresh. A server that binds tokens to an audience (Kontrcheck's connector does)
