@@ -96,6 +96,10 @@ Global servers (added in **Settings → MCP**) are visible in every workspace. U
 - `exclude` lists global servers to hide in this workspace (their tools are masked through the tool registry's per-agent restriction). Toggle it via the **隐藏 / Hide** checkbox on each global server in the workspace view.
 - `serverName` must be unique across global + all workspace sources; a later duplicate is flagged as a conflict and skipped (shown in the UI).
 - Config is re-read on each new session and hot-reloaded via a file watcher.
+- Workspace connection failures retry automatically after 3s, 6s, 12s, up to 60s; a successful connection resets the delay. SSE session loss reconnects immediately and refreshes tools for existing agents. Credential-gated servers remain `needs-auth`. Editing/deleting a server, closing its last session, or unloading the plugin cancels pending retries.
+- Workspace **Logs** and `POST /mcp-manager/api/servers/:id/connect` work for loaded workspace servers. Logs retain redacted failure causes (such as `ECONNREFUSED`) across config rescans; deleting the server clears them.
+
+Recovery regression tests run with `node --test test/workspace-reconnect.test.js`. For an opt-in real Loader smoke, install `@deepseek-ai/dsh@0.2.1-rc.2` into a disposable npm prefix, then run `node scripts/verify-real-dsh.mjs <prefix>`. The script creates and deletes its own temporary profile and workspace, uses loopback MCP only, and submits no model request. Verified on macOS / Node 24.12.0; Windows remains unverified.
 - Workspace servers support **stdio**, **HTTP static-token** (`tokenEnv`), **HTTP OAuth** (the same discovery + PKCE + dynamic client registration flow as global servers, including the optional `clientId` / `clientSecretEnv` / `scope` fields in the hand-written config), and **HTTP no-auth** (`authMode: "none"`, no `Authorization` header). Workspace OAuth tokens persist in `~/.dsh/mcp-manager.json` (never in the declarative `mcp.json`); each workspace server row exposes a **去认证 / Authenticate** button for OAuth servers.
 
 ## How it works
