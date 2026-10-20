@@ -349,16 +349,8 @@ it('honours a forwarded origin only when it is explicitly allowed', async (t) =>
   });
   assert.equal(unlisted.code, 200, unlisted.text);
   assert.equal(new URL(unlisted.json.authorizeUrl).searchParams.get('redirect_uri'),
-    `http://127.0.0.1:3080/mcp-manager/callback/${id}`,
-    'an unlisted forwarded host is ignored, never adopted');
-
-  // A host header alone never becomes the public origin.
-  const bareHost = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
-    host: 'evil.example.com',
-  });
-  assert.equal(bareHost.code, 200, bareHost.text);
-  assert.equal(new URL(bareHost.json.authorizeUrl).searchParams.get('redirect_uri'), `http://evil.example.com/mcp-manager/callback/${id}`,
-    'a plain Host header still names the origin the browser used');
+    `https://harness.example.com/mcp-manager/callback/${id}`,
+    'an unlisted forwarded host is ignored, and the configured origin names the callback');
   await stub.close();
 });
 
@@ -377,6 +369,52 @@ it('ignores forwarded headers entirely when no public origin is configured', asy
   assert.equal(new URL(auth.json.authorizeUrl).searchParams.get('redirect_uri'),
     `http://127.0.0.1:3080/mcp-manager/callback/${id}`,
     'without an explicit allowlist the forwarded pair must not be trusted');
+  await stub.close();
+});
+
+it('keeps the configured https callback when the proxy sends no X-Forwarded-Proto', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx({ publicOrigins: ['https://harness.example.com'] });
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'plain-http', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+
+  // Browsers behind Caddy reach the GUI as plain HTTP on the loopback hop; the
+  // forwarded proto may be missing entirely. The configured public origin is the
+  // only external address, so it must win instead of the http Host.
+  const auth = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+    host: 'harness.example.com',
+  });
+  assert.equal(auth.code, 200, auth.text);
+  assert.equal(new URL(auth.json.authorizeUrl).searchParams.get('redirect_uri'),
+    `https://harness.example.com/mcp-manager/callback/${id}`);
+  const register = stub.registerBodies.at(-1);
+  assert.deepEqual(register.redirect_uris, [`https://harness.example.com/mcp-manager/callback/${id}`],
+    'the dynamic registration must declare the https callback');
+  await stub.close();
+});
+
+it('never turns a foreign Host into the external callback', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx({ publicOrigins: ['https://harness.example.com'] });
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'foreign', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+
+  const auth = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/auth`, undefined, {
+    host: 'evil.example.com',
+  });
+  assert.equal(auth.code, 200, auth.text);
+  const redirect = new URL(auth.json.authorizeUrl).searchParams.get('redirect_uri');
+  assert.equal(redirect, `https://harness.example.com/mcp-manager/callback/${id}`);
+  assert.ok(!redirect.includes('evil.example.com'), 'a foreign Host must not name the callback');
+
+  // Without a configured public origin there is nothing to fall back to: an
+  // external Host is refused rather than adopted.
+  const bare = makeCtx();
+  const created2 = await request(bare.handler, 'POST', '/mcp-manager/api/servers', { name: 'foreign2', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const refused = await request(bare.handler, 'POST', `/mcp-manager/api/servers/${created2.json.server.id}/auth`, undefined, { host: 'evil.example.com' });
+  assert.equal(refused.code, 400, refused.text);
   await stub.close();
 });
 
