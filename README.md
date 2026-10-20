@@ -7,7 +7,14 @@
 The built-in `@deepseek-ai/dsh-mcp-client` only accepts a static `headers` config — it has no OAuth support and no local stdio transport. This plugin fills that gap:
 
 - **OAuth (authorization code + PKCE)** with spec-compliant discovery, RFC 7591 dynamic client registration, `refresh_token` rotation, and auto-reconnect across restarts — one browser login, then it keeps working.
+  - **Callback origin** honours a reverse proxy's `X-Forwarded-Proto`/`X-Forwarded-Host` pair
+    (both must be present and the host must look like `host[:port]`), so an HTTPS deployment
+    registers `https://…/mcp-manager/callback/<id>` instead of silently using plain http.
   - **Discovery** follows RFC 9728 → RFC 8414: the MCP endpoint's 401 `WWW-Authenticate` header names its protected-resource metadata, that document names the authorization server, and the authorization server's metadata is read from the RFC 8414 path-inserted URL (e.g. `https://github.com/.well-known/oauth-authorization-server/login/oauth`). Only when nothing is discoverable does it fall back to guessing `${origin}/oauth/*`, and the attempt log says so.
+  - **RFC 8707 `resource`** taken from the protected-resource document and sent on authorize, token
+    exchange and refresh. A server that binds tokens to an audience (Kontrcheck's connector does)
+    rejects every step without it as `invalid_target`. Providers that publish no resource keep
+    the previous behaviour exactly: nothing is invented.
   - **Manual client credentials** for authorization servers that do not support dynamic registration (GitHub's does not): set **Client ID** to an app you registered with the provider, optionally a **Client secret environment variable** name (sent as `client_secret`; the secret itself is never persisted), and a **Scope** string.
 - **Static Bearer token** mode for servers without OAuth — stored as an environment-variable **name** (Codex-style `tokenEnv`), never as plaintext in the config.
 - **No auth** mode for servers that need no credentials at all (e.g. a local `http://127.0.0.1:9316/mcp`) — the plugin sends no `Authorization` header and connects on save.
