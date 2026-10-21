@@ -8,7 +8,7 @@
  * request without the resource, and refresh tokens are single-use.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -79,7 +79,7 @@ const state = () => JSON.parse(readFileSync(statePath, 'utf8'));
  * single-use refresh rotation, and an MCP endpoint that only accepts the live
  * access token.
  */
-function startStub({ publishResource = true } = {}) {
+function startStub({ publishResource = true, refreshMode = 'rotate', refreshDelayMs = 0 } = {}) {
   const seen = [];
   const tokenForms = [];
   const registerBodies = [];
@@ -147,13 +147,19 @@ function startStub({ publishResource = true } = {}) {
           return send(200, { access_token: access, refresh_token: refresh, token_type: 'Bearer', expires_in: 28800 });
         }
         if (form.get('grant_type') === 'refresh_token') {
-          if (form.get('refresh_token') !== currentRefresh) return send(400, { error: 'invalid_grant' });
-          issued += 1;
-          const access = `access-${issued}`;
-          const refresh = `refresh-${issued}`;
-          validAccess.add(access);
-          currentRefresh = refresh;
-          return send(200, { access_token: access, refresh_token: refresh, token_type: 'Bearer', expires_in: 28800 });
+          const reply = () => {
+            if (refreshMode === 'invalid_grant') return send(400, { error: 'invalid_grant' });
+            if (refreshMode === 'unavailable') return send(500, { error: 'temporarily_unavailable' });
+            if (form.get('refresh_token') !== currentRefresh) return send(400, { error: 'invalid_grant' });
+            issued += 1;
+            const access = `access-${issued}`;
+            const refresh = `refresh-${issued}`;
+            validAccess.add(access);
+            currentRefresh = refresh;
+            return send(200, { access_token: access, refresh_token: refresh, token_type: 'Bearer', expires_in: 28800 });
+          };
+          if (refreshDelayMs) return setTimeout(reply, refreshDelayMs);
+          return reply();
         }
         return send(400, { error: 'unsupported_grant_type' });
       }
@@ -173,6 +179,7 @@ function startStub({ publishResource = true } = {}) {
         registerBodies,
         invalidate() { validAccess.clear(); },
         currentRefresh: () => currentRefresh,
+        mint(access, refresh) { validAccess.add(access); currentRefresh = refresh; },
         async close() {
           server.closeAllConnections?.();
           await new Promise((done) => server.close(done));
@@ -432,4 +439,152 @@ it('escapes server-supplied text on the callback page', async (t) => {
   assert.match(callback.text, /&lt;img/);
   assert.match(callback.text, /Authorization failed/);
   await stub.close();
+});
+
+// ---------- refresh safety: one flight, one process at a time ----------
+
+const writeState = (value) => writeFileSync(statePath, JSON.stringify(value, null, 2));
+const serverNamed = (name) => state().servers.find((server) => server.name === name);
+const refreshForms = (stub) => stub.tokenForms.filter((form) => form.get('grant_type') === 'refresh_token');
+
+function expireSavedPair(name) {
+  const st = state();
+  const server = st.servers.find((candidate) => candidate.name === name);
+  server.oauth.tokens.expires_at = Date.now() - 1000;
+  writeState(st);
+}
+
+async function runRestartProbe(id) {
+  return await new Promise((resolve, reject) => {
+    const proc = spawn(process.execPath, [fixture, id], {
+      env: { ...process.env, HOME: scratchHome, USERPROFILE: scratchHome, DSH_HOME: join(scratchHome, '.dsh') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk) => { stdout += chunk; });
+    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+    proc.on('error', reject);
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error(`restart probe timed out: ${stderr}`)); }, 30_000);
+    proc.on('exit', (code) => { clearTimeout(timer); resolve({ status: code, stdout, stderr }); });
+  });
+}
+
+it('issues exactly one refresh when two connects race on the same expired pair', async (t) => {
+  const stub = await startStub({ refreshDelayMs: 200 });
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'race', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  stub.invalidate();
+  const [first, second] = await Promise.all([
+    request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`),
+    request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`),
+  ]);
+  assert.equal(first.code, 200, first.text);
+  assert.equal(second.code, 200, second.text);
+  assert.equal(refreshForms(stub).length, 1, 'two concurrent 401s must share one refresh');
+  assert.equal(serverNamed('race').oauth.tokens.refresh_token, 'refresh-2');
+  assert.equal(serverNamed('race').oauth.needsReauth, false);
+});
+
+it('refreshes proactively in a fresh process when the saved access token is expired', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'proactive', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  expireSavedPair('proactive');
+  const before = refreshForms(stub).length;
+  const child = await runRestartProbe(id);
+  assert.equal(child.status, 0, child.stderr);
+  const verdict = JSON.parse(child.stdout.trim().split('\n').at(-1));
+  assert.equal(verdict.code, 200, verdict.body);
+  assert.equal(refreshForms(stub).length, before + 1, 'the probe refreshes once before its first request');
+  assert.equal(serverNamed('proactive').oauth.tokens.refresh_token, 'refresh-2');
+});
+
+it('stops on invalid_grant and asks for re-authorization instead of replaying the token', async (t) => {
+  const stub = await startStub({ refreshMode: 'invalid_grant' });
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'dead', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  stub.invalidate();
+  const first = await request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`);
+  assert.equal(first.code, 200, first.text);
+  assert.equal(serverNamed('dead').oauth.needsReauth, true);
+  assert.equal(serverNamed('dead').oauth.lastRefreshError, 'invalid_grant');
+  const view = (await request(handler, 'GET', '/mcp-manager/api/servers')).json.servers.find((server) => server.name === 'dead');
+  assert.equal(view.status, 'needs-auth');
+  assert.match(view.error, /re-authorization required/);
+
+  const before = refreshForms(stub).length;
+  await request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`);
+  assert.equal(refreshForms(stub).length, before, 'a spent refresh token must not be replayed');
+});
+
+it('adopts a pair another process refreshed instead of sending the spent token', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'adopt', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  // The in-memory copy is expired, while the file already carries a pair that
+  // a second DSH process refreshed. The lock/re-read must adopt it, not spend
+  // the expired refresh token again.
+  expireSavedPair('adopt');
+  const { handler: staleHandler } = makeCtx();
+  stub.mint('access-other', 'refresh-other');
+  const st = state();
+  st.servers.find((server) => server.name === 'adopt').oauth.tokens = {
+    access_token: 'access-other', refresh_token: 'refresh-other', expires_at: Date.now() + 3600_000,
+  };
+  writeState(st);
+
+  const before = refreshForms(stub).length;
+  const connected = await request(staleHandler, 'POST', `/mcp-manager/api/servers/${id}/connect`);
+  assert.equal(connected.code, 200, connected.text);
+  assert.equal(refreshForms(stub).length, before, 'the fresh pair must be adopted without another refresh');
+  assert.equal(serverNamed('adopt').oauth.tokens.refresh_token, 'refresh-other');
+});
+
+it('keeps the pair and retries after a transient token-endpoint failure', async (t) => {
+  const stub = await startStub({ refreshMode: 'unavailable' });
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'transient', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  stub.invalidate();
+  await request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`);
+  assert.equal(serverNamed('transient').oauth.needsReauth, false, 'a 5xx is not a reason to demand re-authorization');
+  assert.equal(serverNamed('transient').oauth.lastRefreshError, 'temporarily_unavailable');
+
+  const before = refreshForms(stub).length;
+  await request(handler, 'POST', `/mcp-manager/api/servers/${id}/connect`);
+  assert.equal(refreshForms(stub).length, before + 1, 'the next attempt is allowed to retry');
+});
+
+it('writes the token file atomically with mode 0600 and leaves no temp files', async (t) => {
+  const stub = await startStub();
+  t.after(() => stub.close());
+  const { handler } = makeCtx();
+  const created = await request(handler, 'POST', '/mcp-manager/api/servers', { name: 'atomic', type: 'http', url: stub.mcpUrl, authMode: 'oauth' });
+  const id = created.json.server.id;
+  await complete(handler, id, await authorize(handler, id));
+
+  assert.equal(statSync(statePath).mode & 0o777, 0o600, 'the token file must stay private');
+  const leftovers = readdirSync(join(scratchHome, '.dsh')).filter((name) => name.includes('.tmp'));
+  assert.deepEqual(leftovers, [], 'no half-written temp file may survive a save');
+  assert.equal(serverNamed('atomic').oauth.tokens.access_token, 'access-1');
 });
